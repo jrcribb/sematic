@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import signal
+import sys
 import time
 import typing
 from contextlib import contextmanager
@@ -79,15 +80,16 @@ class StateMachineRunner(Runner, abc.ABC):
         self._pipeline_run_will_start()
 
         while not self._root_future.state.is_terminal():
+            state_changed = False
             for future_ in self._futures:
                 if future_.state == FutureState.CREATED:
-                    self._schedule_future_if_args_concrete(future_)
+                    state_changed |= self._schedule_future_if_args_concrete(future_)
                     continue
                 if future_.state == FutureState.RETRYING:
-                    self._execute_future(future_)
+                    state_changed |= self._execute_future(future_)
                     continue
                 if future_.state == FutureState.RAN:
-                    self._run_nested_future(future_)
+                    state_changed |= self._run_nested_future(future_)
                     continue
 
                 # should be unreachable code, here for a sanity check
@@ -100,7 +102,14 @@ class StateMachineRunner(Runner, abc.ABC):
                         " when it should have been already processed"
                     )
 
-            self._wait_for_scheduled_runs_with_timeout()
+            if not state_changed:
+                logger.info("Entering wait")
+                # we only want to enter a waiting state if nothing changed.
+                # otherwise there might be other things we can schedule
+                # before starting the wait.
+                self._wait_for_scheduled_runs_with_timeout()
+            else:
+                logger.info("Checking for ability to schedule more")
 
         if self._root_future.state == FutureState.RESOLVED:
             self._pipeline_run_did_succeed()
@@ -147,20 +156,37 @@ class StateMachineRunner(Runner, abc.ABC):
 
         self._enqueue_future(future)
 
+    def _cancel_on_sigterm(self) -> bool:
+        return True
+
     def _register_signal_handlers(self):
         runner_pid = os.getpid()
         original_handlers: typing.Dict[int, HandlerType] = dict()
 
         def _handle_sig_cancel(signum: int, frame: FrameType) -> None:
             if runner_pid == os.getpid():
-                logger.warning("Received signal %s; canceling pipeline run...", signum)
-                self._pipeline_run_did_cancel()
+                if self._cancel_on_sigterm():
+                    logger.warning(
+                        "Received signal %s; canceling pipeline run...", signum
+                    )
+                    self._pipeline_run_did_cancel()
 
-                # Raising an error ensures execution doesn't resume where it left off
-                # after the handler exits.
-                raise CancellationError(
-                    f"Pipeline run cancelled due to signal {signum}"
-                )
+                    # Raising an error ensures execution doesn't resume where it left off
+                    # after the handler exits.
+                    raise CancellationError(
+                        f"Pipeline run cancelled due to signal {signum}"
+                    )
+                else:
+                    # Common exit code for exits due to a particular signal
+                    # is signal number + 128:
+                    # https://stackoverflow.com/a/1535733/2540669
+                    exit_code = 128 + signum
+                    logger.warning(
+                        "Received signal %s; exiting with code %s...", signum, exit_code
+                    )
+                    sys.stderr.flush()
+                    sys.stdout.flush()
+                    sys.exit(exit_code)
 
             # this branch is possible when using LocalRunner,
             # or if inlined funcs spawn processes when using CloudRunner
@@ -439,34 +465,39 @@ class StateMachineRunner(Runner, abc.ABC):
         return concrete_kwargs
 
     @typing.final
-    def _schedule_future_if_args_concrete(self, future: AbstractFuture) -> None:
+    def _schedule_future_if_args_concrete(self, future: AbstractFuture) -> bool:
+        """Schedule a future if its inputs are ready. Return True if it was scheduled."""
         concrete_kwargs = self._get_concrete_kwargs(future)
 
         all_args_concrete = len(concrete_kwargs) == len(future.kwargs)
 
         if all_args_concrete:
             future.resolved_kwargs = concrete_kwargs
-            self._execute_future(future)
+            return self._execute_future(future)
+        return False
 
-    def _execute_future(self, future: AbstractFuture) -> None:
+    def _execute_future(self, future: AbstractFuture) -> bool:
         """
-        Attempts to execute the given Future.
+        Attempts to execute the given Future. Returns true if it did.
         """
         if not self._can_schedule_future(future):
             logger.info("Currently not scheduling %s", future.function)
-            return
+            return False
 
         self._future_will_schedule(future)
 
         if future.props.standalone:
             logger.info("Scheduling %s %s", future.id, future.function)
             self._schedule_future(future)
+            return True
         else:
             logger.info("Running inline %s %s", future.id, future.function)
             self._run_inline(future)
+            return True
 
     @typing.final
-    def _run_nested_future(self, future: AbstractFuture) -> None:
+    def _run_nested_future(self, future: AbstractFuture) -> bool:
+        """Bubble resolved state up the tree. Return true if a state was changed"""
         if future.nested_future is None:
             raise RuntimeError("No nested future")
 
@@ -475,6 +506,8 @@ class StateMachineRunner(Runner, abc.ABC):
         if nested_future.state == FutureState.RESOLVED:
             future.value = nested_future.value
             self._set_future_state(future, FutureState.RESOLVED)
+            return True
+        return False
 
     def _handle_future_failure(
         self,
