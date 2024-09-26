@@ -55,6 +55,14 @@ pytest_test(
 )
 
 pytest_test(
+    name = "test_3_11_interpreter",
+    srcs = ["test_3_11_interpreter.py"],
+    pip_deps = ["requests"],
+    py_versions = [PY3.PY3_11],
+    deps = [],
+)
+
+pytest_test(
     name = "test_3_10_function",
     srcs = ["test_3_10_function.py"],
     pip_deps = [],
@@ -183,6 +191,7 @@ pytest_test(
         "//sematic/db:db",
         "//sematic/db/models:run",
         "//sematic/db/tests:fixtures",
+        "//sematic/metrics/tests:fixtures",
         "//sematic/metrics:metric_point",
         "//sematic/utils:exceptions",
     ],
