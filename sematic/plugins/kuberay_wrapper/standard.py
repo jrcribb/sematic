@@ -5,7 +5,11 @@ from typing import Any, Dict, Tuple, Type, Union
 
 # Sematic
 from sematic.abstract_plugin import AbstractPluginSettingsVar
-from sematic.config.server_settings import ServerSettingsVar, get_server_setting
+from sematic.config.server_settings import (
+    ServerSettingsVar,
+    get_json_server_setting,
+    get_server_setting,
+)
 from sematic.config.settings import get_plugin_setting
 from sematic.plugins.abstract_kuberay_wrapper import (
     AbstractKuberayWrapper,
@@ -36,6 +40,22 @@ class StandardKuberaySettingsVar(AbstractPluginSettingsVar):
     RAY_NON_GPU_TOLERATIONS:
         The Kubernetes tolerations that will be used for Ray nodes
         that don't use GPUs. Value should be json encoded into a string.
+    RAY_GPU_LABELS:
+         The Kubernetes labels that will be used for Ray nodes that use
+         GPUs. Value should be a json encoded object conntaining the
+         keys and values for the labels.
+    RAY_NON_GPU_LABELS:
+         The Kubernetes labels that will be used for Ray nodes that don't
+         use GPUs. Value should be a json encoded object conntaining the
+         keys and values for the labels.
+    RAY_GPU_ANNOTATIONS:
+         The Kubernetes annotations that will be used for Ray nodes that use
+         GPUs. Value should be a json encoded object conntaining the
+         keys and values for the annotations.
+    RAY_NON_GPU_ANNOTATIONS:
+         The Kubernetes annotations that will be used for Ray nodes that don't
+         use GPUs. Value should be a json encoded object conntaining the
+         keys and values for the annotations.
     RAY_GPU_RESOURCE_REQUEST_KEY:
         The key that will be used in the Kubernetes resource requests/
         limits fields to indicate how many GPUs are required for Ray
@@ -59,6 +79,10 @@ class StandardKuberaySettingsVar(AbstractPluginSettingsVar):
     RAY_GPU_RESOURCE_REQUEST_KEY = "RAY_GPU_RESOURCE_REQUEST_KEY"
     RAY_SUPPORTS_GPUS = "RAY_SUPPORTS_GPUS"
     RAY_BUSYBOX_PULL_OVERRIDE = "RAY_BUSYBOX_PULL_OVERRIDE"
+    RAY_GPU_LABELS = "RAY_GPU_LABELS"
+    RAY_NON_GPU_LABELS = "RAY_NON_GPU_LABELS"
+    RAY_GPU_ANNOTATIONS = "RAY_GPU_ANNOTATIONS"
+    RAY_NON_GPU_ANNOTATIONS = "RAY_NON_GPU_ANNOTATIONS"
 
 
 class _NeedsOverride:
@@ -78,6 +102,7 @@ _WORKER_GROUP_TEMPLATE: Dict[str, Any] = {
     "groupName": _NeedsOverride,
     "rayStartParams": {"block": "true"},
     "template": {
+        "metadata": {"labels": _NeedsOverride, "annotations": _NeedsOverride},
         "spec": {
             "containers": [
                 {
@@ -113,7 +138,7 @@ _WORKER_GROUP_TEMPLATE: Dict[str, Any] = {
             "serviceAccountName": _NeedsOverride,
             "nodeSelector": _NeedsOverride,
             "volumes": [{"name": "ray-logs", "emptyDir": {}}],
-        }
+        },
     },
 }
 
@@ -152,7 +177,7 @@ _MANIFEST_TEMPLATE: Dict[str, Any] = {
             "serviceType": "ClusterIP",
             "rayStartParams": {"dashboard-host": "0.0.0.0", "block": "true"},
             "template": {
-                "metadata": {"labels": {}},
+                "metadata": {"labels": _NeedsOverride, "annotations": _NeedsOverride},
                 "spec": {
                     "containers": [
                         {
@@ -227,9 +252,7 @@ class StandardKuberayWrapper(AbstractKuberayWrapper):
         manifest = deepcopy(cls._manifest_template)
         manifest["metadata"]["name"] = cluster_name
         manifest["spec"]["rayVersion"] = cluster_config.ray_version
-        manifest["spec"][
-            "enableInTreeAutoscaling"
-        ] = cluster_config.requires_autoscale()
+        manifest["spec"]["enableInTreeAutoscaling"] = cluster_config.requires_autoscale()
 
         autoscaler_config = AutoscalerConfig(
             cpu=0.5,
@@ -264,12 +287,12 @@ class StandardKuberayWrapper(AbstractKuberayWrapper):
         group_manifest["maxReplicas"] = worker_group.max_workers
         group_manifest["groupName"] = f"worker-group-{group_index}"
         group_manifest["template"]["spec"]["containers"][0]["image"] = image_uri
-        group_manifest["template"]["spec"]["containers"][0]["resources"][
-            "limits"
-        ] = cls._limits_for_node(worker_group.worker_nodes)
-        group_manifest["template"]["spec"]["containers"][0]["resources"][
-            "requests"
-        ] = cls._requests_for_node(worker_group.worker_nodes)
+        group_manifest["template"]["spec"]["containers"][0]["resources"]["limits"] = (
+            cls._limits_for_node(worker_group.worker_nodes)
+        )
+        group_manifest["template"]["spec"]["containers"][0]["resources"]["requests"] = (
+            cls._requests_for_node(worker_group.worker_nodes)
+        )
         group_manifest["template"]["spec"]["nodeSelector"] = cls._get_node_selector(
             worker_group.worker_nodes
         )
@@ -277,12 +300,16 @@ class StandardKuberayWrapper(AbstractKuberayWrapper):
             worker_group.worker_nodes
         )
         group_manifest["template"]["spec"]["serviceAccount"] = _get_service_account()
-        group_manifest["template"]["spec"][
-            "serviceAccountName"
-        ] = _get_service_account()
+        group_manifest["template"]["spec"]["serviceAccountName"] = _get_service_account()
         group_manifest["template"]["spec"]["initContainers"][0]["image"] = _get_setting(
             StandardKuberaySettingsVar.RAY_BUSYBOX_PULL_OVERRIDE,
             _DEFAULT_BUSYBOX_PULL,
+        )
+        group_manifest["template"]["metadata"]["labels"] = cls._get_tags(
+            worker_group.worker_nodes, is_label=True
+        )
+        group_manifest["template"]["metadata"]["annotations"] = cls._get_tags(
+            worker_group.worker_nodes, is_label=False
         )
 
         return group_manifest
@@ -309,9 +336,7 @@ class StandardKuberayWrapper(AbstractKuberayWrapper):
         requires_gpus = cluster_config.head_node.gpu_count != 0 or any(
             group.worker_nodes.gpu_count != 0 for group in cluster_config.scaling_groups
         )
-        supports_gpus = _get_setting(
-            StandardKuberaySettingsVar.RAY_SUPPORTS_GPUS, False
-        )
+        supports_gpus = _get_setting(StandardKuberaySettingsVar.RAY_SUPPORTS_GPUS, False)
         if requires_gpus and not supports_gpus:
             raise UnsupportedUsageError(
                 f"The Kuberay plugin {cls.__name__} is not configured "
@@ -324,6 +349,20 @@ class StandardKuberayWrapper(AbstractKuberayWrapper):
             raise UnsupportedVersionError(
                 "Only ray versions 2.0 or higher are supported."
             )
+
+    @classmethod
+    def _get_tags(cls, node_config: RayNodeConfig, is_label: bool) -> Dict[str, str]:
+        requires_gpu = node_config.gpu_count > 0
+        settings_var = {
+            (False, False): StandardKuberaySettingsVar.RAY_NON_GPU_ANNOTATIONS,
+            (False, True): StandardKuberaySettingsVar.RAY_NON_GPU_LABELS,
+            (True, False): StandardKuberaySettingsVar.RAY_GPU_ANNOTATIONS,
+            (True, True): StandardKuberaySettingsVar.RAY_GPU_LABELS,
+        }[(requires_gpu, is_label)]
+        tags = get_json_server_setting(settings_var, {})  # type: ignore
+        if tags is None:
+            tags = {}
+        return tags
 
     @classmethod
     def _make_head_group_spec(
@@ -339,18 +378,22 @@ class StandardKuberayWrapper(AbstractKuberayWrapper):
         head_group_template["template"]["spec"]["containers"][0]["resources"][
             "requests"
         ] = cls._requests_for_node(node_config)
-        head_group_template["template"]["spec"][
-            "nodeSelector"
-        ] = cls._get_node_selector(node_config)
+        head_group_template["template"]["spec"]["nodeSelector"] = cls._get_node_selector(
+            node_config
+        )
         head_group_template["template"]["spec"]["tolerations"] = cls._get_tolerations(
             node_config
         )
-        head_group_template["template"]["spec"][
-            "serviceAccount"
-        ] = _get_service_account()
-        head_group_template["template"]["spec"][
-            "serviceAccountName"
-        ] = _get_service_account()
+        head_group_template["template"]["spec"]["serviceAccount"] = _get_service_account()
+        head_group_template["template"]["spec"]["serviceAccountName"] = (
+            _get_service_account()
+        )
+        head_group_template["template"]["metadata"]["labels"] = cls._get_tags(
+            node_config, is_label=True
+        )
+        head_group_template["template"]["metadata"]["annotations"] = cls._get_tags(
+            node_config, is_label=False
+        )
 
         return head_group_template
 
